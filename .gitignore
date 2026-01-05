@@ -1,0 +1,7 @@
+**/.venv
+**/.jar
+**/.ipynb_checkpoints
+**/__pycache__
+
+# local wandb files
+src/wandb
