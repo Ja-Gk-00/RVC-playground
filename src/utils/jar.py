@@ -69,18 +69,12 @@ class Jar:
             pickle.dump(obj, f)
 
     def get(self, name: str) -> Any:
-        """
-        Load the most recent object with the given name.
-
-        Args:
-            name (str): The name of the object.
-
-        Returns:
-            Any: The loaded object.
-        """
+        if name.endswith(".pkl"):
+            name = name[:-4]
         full_path = self._get_latest_file(name)
         with open(full_path, "rb") as f:
             return pickle.load(f)
+
 
     def get_all(self, name: str) -> dict[datetime, Any]:
         """
