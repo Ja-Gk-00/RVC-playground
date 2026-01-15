@@ -1,29 +1,40 @@
 # src/scripts/infer.py
 import argparse
-
 from src.modules.inference import run_inference
-from src.models.generator import Generator
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run inference to convert voice.")
-    parser.add_argument("--input", required=True, help="Path to input audio file (.wav/.flac/.mp3).")
-    parser.add_argument("--model", required=True, help="Name of saved Generator model (from Jar).")
-    parser.add_argument("--output", required=True, help="Path to save output audio.")
-    parser.add_argument("--hubert_path", "--hubert-path", dest="hubert_path", default=None)
-    parser.add_argument("--rmvpe_path", "--rmvpe-path", dest="rmvpe_path", default=None)
-    parser.add_argument("--no_normalize", dest="normalize", action="store_false")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="RVC inference (Jar model name + optional FAISS retrieval).")
+    p.add_argument("--input", required=True)
+    p.add_argument("--model", required=True)   # Jar object name
+    p.add_argument("--output", required=True)
 
-    generator = Generator.load(args.model)
+    p.add_argument("--hubert_path", default=None)
+    p.add_argument("--rmvpe_path", default=None)
+    p.add_argument("--use_pitch", action="store_true")
+    p.add_argument("--target_sr", type=int, default=48000)
+    p.add_argument("--device", default=None)
+
+    p.add_argument("--index", default=None)
+    p.add_argument("--index_data", default=None)
+    p.add_argument("--index_rate", type=float, default=0.5)
+    p.add_argument("--k", type=int, default=8)
+
+    args = p.parse_args()
 
     run_inference(
         input_path=args.input,
-        generator=generator,
         output_path=args.output,
+        model_name=args.model,
         hubert_path=args.hubert_path,
         rmvpe_path=args.rmvpe_path,
-        normalize_output=bool(args.normalize),
+        use_pitch=args.use_pitch,
+        target_sr=args.target_sr,
+        device=args.device,
+        index_path=args.index,
+        index_data_path=args.index_data,
+        index_rate=args.index_rate,
+        k=args.k,
     )
 
 

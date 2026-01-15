@@ -1,63 +1,127 @@
 # src/modules/training.py
-import numpy as np
+"""Training module for RVC generator."""
+from __future__ import annotations
+
 from pathlib import Path
 
-from src.models.generator import Generator
+import numpy as np
+
 from src.data_models.data_models import PreprocessedData
+from src.models.generator import Generator
 
 
-def train_generator_from_features(
-    feature_dir: str,
-    epochs: int = 50,
-    batch_size: int = 1,
-    content_dim: int | None = None,
-    use_pitch: bool = True,
-    target_sr: int = 48000,
-    learning_rate: float = 1e-4,
-    model_name: str = "my_voice_rvc",
-) -> Generator:
-    feature_dir_p = Path(feature_dir)
+def _load_feature_triplets(feature_dir: Path) -> PreprocessedData:
+    """Load preprocessed feature triplets from directory."""
+    content_files = sorted(feature_dir.glob("*_units.npy"))
+    f0_files = sorted(feature_dir.glob("*_f0.npy"))
+    audio_files = sorted(feature_dir.glob("*_audio.npy"))
 
-    content_files = sorted(feature_dir_p.glob("*_units.npy"))
-    f0_files = sorted(feature_dir_p.glob("*_f0.npy"))
-    audio_files = sorted(feature_dir_p.glob("*_audio.npy"))
-
-    if not content_files or not f0_files:
-        raise ValueError(f"No *_units.npy or *_f0.npy files found in {feature_dir_p}")
-
+    if not content_files:
+        raise ValueError(f"No *_units.npy found in {feature_dir}")
+    if not f0_files:
+        raise ValueError(f"No *_f0.npy found in {feature_dir}")
     if not audio_files:
         raise ValueError(
-            f"No *_audio.npy found in {feature_dir_p}. "
-            "Preprocessing must save aligned waveform targets per segment (seg_000001_audio.npy)."
+            f"No *_audio.npy found in {feature_dir}. Your preprocessing must save aligned waveform targets per segment."
         )
 
-    # Auto-detect content_dim from data to avoid silent/broken inference due to mismatch
-    first = np.load(content_files[0])
-    detected_dim = int(first.shape[1])
-    if content_dim is None:
-        content_dim = detected_dim
-    elif int(content_dim) != detected_dim:
-        raise ValueError(f"content_dim={content_dim} but features have dim={detected_dim}. Use the detected value.")
+    print(f"Loading {len(content_files)} samples from {feature_dir}")
 
-    contents = [np.load(f).astype(np.float32) for f in content_files]
-    f0s = [np.load(f).astype(np.float32) for f in f0_files]
-    audios = [np.load(f).astype(np.float32) for f in audio_files]
+    contents = [np.load(f) for f in content_files]
+    f0s = [np.load(f) for f in f0_files]
+    audios = [np.load(f) for f in audio_files]
 
-    preprocessed = PreprocessedData(
+    return PreprocessedData(
         content_vectors=np.array(contents, dtype=object),
         pitch_features=np.array(f0s, dtype=object),
         audios=audios,
     )
 
-    generator = Generator(
-        content_dim=int(content_dim),
-        use_pitch=bool(use_pitch),
-        target_sr=int(target_sr),
-        learning_rate=float(learning_rate),
+
+def train_generator_from_features(
+    feature_dir: str,
+    epochs: int = 200,
+    batch_size: int = 4,
+    content_dim: int = 768,
+    hidden_dim: int = 192,
+    target_sr: int = 48000,
+    learning_rate: float = 1e-4,
+    model_name: str = "my_voice_rvc",
+    pretrained_rvc: bool = False,
+    pretrained: str | None = None,
+    pretrained_g: str | None = None,
+    pretrained_d: str | None = None,
+    fp16: bool = True,
+    device: str | None = None,
+) -> Generator:
+    """
+    Train RVC generator from preprocessed features.
+
+    Args:
+        feature_dir: Directory containing preprocessed features
+        epochs: Number of training epochs
+        batch_size: Batch size for training
+        content_dim: HuBERT content dimension (768)
+        hidden_dim: Latent dimension (192)
+        target_sr: Target sample rate
+        learning_rate: Learning rate
+        model_name: Name to save model as in Jar
+        pretrained_rvc: Load official RVC pretrained weights (RECOMMENDED)
+        pretrained: Path to custom pretrained model
+        pretrained_g: Path to custom pretrained generator
+        pretrained_d: Path to custom pretrained discriminator
+        fp16: Use mixed precision training
+        device: Device to train on
+
+    Returns:
+        Trained Generator model
+    """
+    feature_path = Path(feature_dir)
+    data = _load_feature_triplets(feature_path)
+
+    print(f"\n{'='*60}")
+    print("RVC Training Configuration")
+    print(f"{'='*60}")
+    print(f"  Samples: {len(data.content_vectors)}")
+    print(f"  Epochs: {epochs}")
+    print(f"  Batch size: {batch_size}")
+    print(f"  Hidden dim: {hidden_dim}")
+    print(f"  Target SR: {target_sr}")
+    print(f"  FP16: {fp16}")
+    print(f"  Pretrained RVC: {pretrained_rvc}")
+    print(f"{'='*60}\n")
+
+    g = Generator(
+        content_dim=content_dim,
+        hidden_dim=hidden_dim,
+        use_pitch=True,  # Always True for NSF
+        target_sr=target_sr,
+        learning_rate=learning_rate,
     )
 
-    generator.train(preprocessed, epochs=int(epochs), batch_size=int(batch_size))
-    generator.save(model_name)
-    print(f"Training complete! Model saved as: {model_name}")
+    # Load pretrained weights
+    if pretrained_rvc:
+        print("Loading official RVC pretrained weights...")
+        g.load_pretrained_rvc(version="v2", load_discriminator=True, verbose=True)
+    elif pretrained or pretrained_g or pretrained_d:
+        print("Loading custom pretrained weights...")
+        g.load_pretrained(
+            pretrained=pretrained,
+            pretrained_g=pretrained_g,
+            pretrained_d=pretrained_d,
+        )
+    else:
+        print("WARNING: Training from scratch. This may take a long time.")
+        print("         Consider using --pretrained_rvc for faster training.")
 
-    return generator
+    try:
+        g.train(data, epochs=epochs, batch_size=batch_size, fp16=fp16, device=device)
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Saving model...")
+        g.save(model_name)
+        print(f"Model saved as: {model_name}")
+        return g
+
+    g.save(model_name)
+    print(f"\nTraining complete! Model saved as: {model_name}")
+    return g

@@ -1,0 +1,577 @@
+# src/models/synthesizer_rvc.py
+"""RVC Synthesizer matching reference implementation exactly."""
+from __future__ import annotations
+
+import math
+import logging
+from typing import Optional
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import Conv1d, ConvTranspose1d
+from torch.nn import functional as F
+from torch.nn.utils import remove_weight_norm, weight_norm
+
+from src.models import attentions, modules
+from src.models.commons import get_padding, init_weights, sequence_mask
+
+logger = logging.getLogger(__name__)
+
+LRELU_SLOPE = 0.1
+
+
+class TextEncoder(nn.Module):
+    """Content encoder matching reference RVC implementation."""
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        f0=True,
+    ):
+        super(TextEncoder, self).__init__()
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.emb_phone = nn.Linear(in_channels, hidden_channels)
+        self.lrelu = nn.LeakyReLU(0.1, inplace=True)
+        if f0:
+            self.emb_pitch = nn.Embedding(256, hidden_channels)
+        self.encoder = attentions.Encoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+        )
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+    def forward(
+        self,
+        phone: torch.Tensor,
+        pitch: Optional[torch.Tensor],
+        lengths: torch.Tensor,
+        skip_head: Optional[torch.Tensor] = None,
+    ):
+        if pitch is None:
+            x = self.emb_phone(phone)
+        else:
+            x = self.emb_phone(phone) + self.emb_pitch(pitch)
+        x = x * math.sqrt(self.hidden_channels)
+        x = self.lrelu(x)
+        x = torch.transpose(x, 1, -1)  # [b, h, t]
+        x_mask = torch.unsqueeze(sequence_mask(lengths, x.size(2)), 1).to(x.dtype)
+        x = self.encoder(x * x_mask, x_mask)
+        if skip_head is not None:
+            head = int(skip_head.item())
+            x = x[:, :, head:]
+            x_mask = x_mask[:, :, head:]
+        stats = self.proj(x) * x_mask
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        return m, logs, x_mask
+
+
+class ResidualCouplingBlock(nn.Module):
+    """Flow block with Flip layers matching reference implementation."""
+    def __init__(
+        self,
+        channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        n_flows=4,
+        gin_channels=0,
+    ):
+        super(ResidualCouplingBlock, self).__init__()
+        self.channels = channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.flows = nn.ModuleList()
+        for i in range(n_flows):
+            self.flows.append(
+                modules.ResidualCouplingLayer(
+                    channels,
+                    hidden_channels,
+                    kernel_size,
+                    dilation_rate,
+                    n_layers,
+                    gin_channels=gin_channels,
+                    mean_only=True,
+                )
+            )
+            self.flows.append(modules.Flip())
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        g: Optional[torch.Tensor] = None,
+        reverse: bool = False,
+    ):
+        if not reverse:
+            for flow in self.flows:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        else:
+            for flow in self.flows[::-1]:
+                x, _ = flow(x, x_mask, g=g, reverse=reverse)
+        return x
+
+    def remove_weight_norm(self):
+        for i in range(self.n_flows):
+            self.flows[i * 2].remove_weight_norm()
+
+
+class PosteriorEncoder(nn.Module):
+    """Posterior encoder matching reference implementation."""
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        hidden_channels,
+        kernel_size,
+        dilation_rate,
+        n_layers,
+        gin_channels=0,
+    ):
+        super(PosteriorEncoder, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.dilation_rate = dilation_rate
+        self.n_layers = n_layers
+        self.gin_channels = gin_channels
+
+        self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+        self.enc = modules.WN(
+            hidden_channels,
+            kernel_size,
+            dilation_rate,
+            n_layers,
+            gin_channels=gin_channels,
+        )
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+
+    def forward(
+        self, x: torch.Tensor, x_lengths: torch.Tensor, g: Optional[torch.Tensor] = None
+    ):
+        x_mask = torch.unsqueeze(sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+        x = self.pre(x) * x_mask
+        x = self.enc(x, x_mask, g=g)
+        stats = self.proj(x) * x_mask
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
+        return z, m, logs, x_mask
+
+    def remove_weight_norm(self):
+        self.enc.remove_weight_norm()
+
+
+class SineGen(torch.nn.Module):
+    """Sine wave generator matching reference implementation."""
+    def __init__(
+        self,
+        samp_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        noise_std=0.003,
+        voiced_threshold=0,
+    ):
+        super(SineGen, self).__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = noise_std
+        self.harmonic_num = harmonic_num
+        self.dim = self.harmonic_num + 1
+        self.sampling_rate = samp_rate
+        self.voiced_threshold = voiced_threshold
+
+    def _f02uv(self, f0):
+        uv = torch.ones_like(f0)
+        uv = uv * (f0 > self.voiced_threshold)
+        return uv
+
+    def _f02sine(self, f0, upp):
+        """f0: (batchsize, length, dim) where dim indicates fundamental and overtones."""
+        a = torch.arange(1, upp + 1, dtype=f0.dtype, device=f0.device)
+        rad = f0 / self.sampling_rate * a
+        rad2 = torch.fmod(rad[:, :-1, -1:].float() + 0.5, 1.0) - 0.5
+        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+        rad += F.pad(rad_acc, (0, 0, 1, 0), mode='constant')
+        rad = rad.reshape(f0.shape[0], -1, 1)
+        b = torch.arange(1, self.dim + 1, dtype=f0.dtype, device=f0.device).reshape(1, 1, -1)
+        rad *= b
+        rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
+        rand_ini[..., 0] = 0
+        rad += rand_ini
+        sines = torch.sin(2 * np.pi * rad)
+        return sines
+
+    def forward(self, f0: torch.Tensor, upp: int):
+        with torch.no_grad():
+            f0 = f0.unsqueeze(-1)
+            sine_waves = self._f02sine(f0, upp) * self.sine_amp
+            uv = self._f02uv(f0)
+            uv = F.interpolate(
+                uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
+            ).transpose(2, 1)
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            noise = noise_amp * torch.randn_like(sine_waves)
+            sine_waves = sine_waves * uv + noise
+        return sine_waves, uv, noise
+
+
+class SourceModuleHnNSF(torch.nn.Module):
+    """Source module matching reference implementation."""
+    def __init__(
+        self,
+        sampling_rate,
+        harmonic_num=0,
+        sine_amp=0.1,
+        add_noise_std=0.003,
+        voiced_threshod=0,
+        is_half=False,
+    ):
+        super(SourceModuleHnNSF, self).__init__()
+        self.sine_amp = sine_amp
+        self.noise_std = add_noise_std
+        self.is_half = is_half
+        self.l_sin_gen = SineGen(
+            sampling_rate, harmonic_num, sine_amp, add_noise_std, voiced_threshod
+        )
+        self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
+        self.l_tanh = torch.nn.Tanh()
+
+    def forward(self, x: torch.Tensor, upp: int = 1):
+        sine_wavs, uv, _ = self.l_sin_gen(x, upp)
+        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
+        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+        return sine_merge, None, None
+
+
+class GeneratorNSF(torch.nn.Module):
+    """NSF Generator matching reference implementation."""
+    def __init__(
+        self,
+        initial_channel,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        gin_channels,
+        sr,
+        is_half=False,
+    ):
+        super(GeneratorNSF, self).__init__()
+        self.num_kernels = len(resblock_kernel_sizes)
+        self.num_upsamples = len(upsample_rates)
+
+        self.f0_upsamp = torch.nn.Upsample(scale_factor=math.prod(upsample_rates))
+        self.m_source = SourceModuleHnNSF(
+            sampling_rate=sr, harmonic_num=0, is_half=is_half
+        )
+        self.noise_convs = nn.ModuleList()
+        self.conv_pre = Conv1d(
+            initial_channel, upsample_initial_channel, 7, 1, padding=3
+        )
+        resblock_cls = modules.ResBlock1
+
+        self.ups = nn.ModuleList()
+        for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
+            c_cur = upsample_initial_channel // (2 ** (i + 1))
+            self.ups.append(
+                weight_norm(
+                    ConvTranspose1d(
+                        upsample_initial_channel // (2 ** i),
+                        upsample_initial_channel // (2 ** (i + 1)),
+                        k,
+                        u,
+                        padding=(k - u) // 2,
+                    )
+                )
+            )
+            if i + 1 < len(upsample_rates):
+                stride_f0 = math.prod(upsample_rates[i + 1:])
+                self.noise_convs.append(
+                    Conv1d(1, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=stride_f0 // 2)
+                )
+            else:
+                self.noise_convs.append(Conv1d(1, c_cur, kernel_size=1))
+
+        self.resblocks = nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = upsample_initial_channel // (2 ** (i + 1))
+            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
+                self.resblocks.append(resblock_cls(ch, k, d))
+
+        self.conv_post = Conv1d(ch, 1, 7, 1, padding=3, bias=False)
+        self.ups.apply(init_weights)
+
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
+
+        self.upp = math.prod(upsample_rates)
+        self.lrelu_slope = LRELU_SLOPE
+
+    def forward(
+        self,
+        x,
+        f0,
+        g: Optional[torch.Tensor] = None,
+        n_res: Optional[torch.Tensor] = None,
+    ):
+        har_source, noi_source, uv = self.m_source(f0, self.upp)
+        har_source = har_source.transpose(1, 2)
+        if n_res is not None:
+            n = int(n_res.item())
+            if n * self.upp != har_source.shape[-1]:
+                har_source = F.interpolate(har_source, size=n * self.upp, mode="linear")
+            if n != x.shape[-1]:
+                x = F.interpolate(x, size=n, mode="linear")
+        x = self.conv_pre(x)
+        if g is not None:
+            x = x + self.cond(g)
+
+        for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
+            if i < self.num_upsamples:
+                x = F.leaky_relu(x, self.lrelu_slope)
+                x = ups(x)
+                x_source = noise_convs(har_source)
+                x = x + x_source
+                xs = None
+                l = [i * self.num_kernels + j for j in range(self.num_kernels)]
+                for j, resblock in enumerate(self.resblocks):
+                    if j in l:
+                        if xs is None:
+                            xs = resblock(x)
+                        else:
+                            xs += resblock(x)
+                x = xs / self.num_kernels
+        x = F.leaky_relu(x)
+        x = self.conv_post(x)
+        x = torch.tanh(x)
+        return x
+
+    def remove_weight_norm(self):
+        for l in self.ups:
+            remove_weight_norm(l)
+        for l in self.resblocks:
+            l.remove_weight_norm()
+
+
+class SynthesizerTrnMs256NSFsid(nn.Module):
+    """Full RVC synthesizer for v1 (256-dim) features - base class."""
+    def __init__(
+        self,
+        spec_channels,
+        segment_size,
+        inter_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        spk_embed_dim,
+        gin_channels,
+        sr,
+        **kwargs
+    ):
+        super(SynthesizerTrnMs256NSFsid, self).__init__()
+        if isinstance(sr, str):
+            sr_map = {"32k": 32000, "40k": 40000, "48k": 48000}
+            sr = sr_map.get(sr, 48000)
+        self.spec_channels = spec_channels
+        self.inter_channels = inter_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = float(p_dropout)
+        self.resblock = resblock
+        self.resblock_kernel_sizes = resblock_kernel_sizes
+        self.resblock_dilation_sizes = resblock_dilation_sizes
+        self.upsample_rates = upsample_rates
+        self.upsample_initial_channel = upsample_initial_channel
+        self.upsample_kernel_sizes = upsample_kernel_sizes
+        self.segment_size = segment_size
+        self.gin_channels = gin_channels
+        self.spk_embed_dim = spk_embed_dim
+
+        self.enc_p = TextEncoder(
+            256,  # v1 uses 256-dim features
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+        )
+        self.dec = GeneratorNSF(
+            inter_channels,
+            resblock,
+            resblock_kernel_sizes,
+            resblock_dilation_sizes,
+            upsample_rates,
+            upsample_initial_channel,
+            upsample_kernel_sizes,
+            gin_channels=gin_channels,
+            sr=sr,
+            is_half=kwargs.get("is_half", False),
+        )
+        self.enc_q = PosteriorEncoder(
+            spec_channels,
+            inter_channels,
+            hidden_channels,
+            5,
+            1,
+            16,
+            gin_channels=gin_channels,
+        )
+        self.flow = ResidualCouplingBlock(
+            inter_channels, hidden_channels, 5, 1, 3, gin_channels=gin_channels
+        )
+        self.emb_g = nn.Embedding(self.spk_embed_dim, gin_channels)
+
+    def remove_weight_norm(self):
+        self.dec.remove_weight_norm()
+        self.flow.remove_weight_norm()
+        if hasattr(self, "enc_q"):
+            self.enc_q.remove_weight_norm()
+
+    @torch.jit.ignore
+    def forward(
+        self,
+        phone: torch.Tensor,
+        phone_lengths: torch.Tensor,
+        pitch: torch.Tensor,
+        pitchf: torch.Tensor,
+        y: torch.Tensor,
+        y_lengths: torch.Tensor,
+        ds: Optional[torch.Tensor] = None,
+    ):
+        from src.models.commons import rand_slice_segments, slice_segments2
+        g = self.emb_g(ds).unsqueeze(-1)
+        m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+        z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+        z_p = self.flow(z, y_mask, g=g)
+        z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size)
+        pitchf = slice_segments2(pitchf, ids_slice, self.segment_size)
+        o = self.dec(z_slice, pitchf, g=g)
+        return o, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+
+    @torch.jit.export
+    def infer(
+        self,
+        phone: torch.Tensor,
+        phone_lengths: torch.Tensor,
+        pitch: torch.Tensor,
+        nsff0: torch.Tensor,
+        sid: torch.Tensor,
+        skip_head: Optional[torch.Tensor] = None,
+        return_length: Optional[torch.Tensor] = None,
+        return_length2: Optional[torch.Tensor] = None,
+    ):
+        g = self.emb_g(sid).unsqueeze(-1)
+        if skip_head is not None and return_length is not None:
+            head = int(skip_head.item())
+            length = int(return_length.item())
+            flow_head = torch.clamp(skip_head - 24, min=0)
+            dec_head = head - int(flow_head.item())
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head)
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            z = z[:, :, dec_head: dec_head + length]
+            x_mask = x_mask[:, :, dec_head: dec_head + length]
+            nsff0 = nsff0[:, head: head + length]
+        else:
+            m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+        o = self.dec(z * x_mask, nsff0, g=g, n_res=return_length2)
+        return o, x_mask, (z, z_p, m_p, logs_p)
+
+
+class SynthesizerTrnMs768NSFsid(SynthesizerTrnMs256NSFsid):
+    """RVC synthesizer for v2 (768-dim HuBERT) features."""
+    def __init__(
+        self,
+        spec_channels,
+        segment_size,
+        inter_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        resblock,
+        resblock_kernel_sizes,
+        resblock_dilation_sizes,
+        upsample_rates,
+        upsample_initial_channel,
+        upsample_kernel_sizes,
+        spk_embed_dim,
+        gin_channels,
+        sr,
+        **kwargs
+    ):
+        super(SynthesizerTrnMs768NSFsid, self).__init__(
+            spec_channels,
+            segment_size,
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            p_dropout,
+            resblock,
+            resblock_kernel_sizes,
+            resblock_dilation_sizes,
+            upsample_rates,
+            upsample_initial_channel,
+            upsample_kernel_sizes,
+            spk_embed_dim,
+            gin_channels,
+            sr,
+            **kwargs
+        )
+        # Replace enc_p with 768-dim version for v2 models
+        del self.enc_p
+        self.enc_p = TextEncoder(
+            768,  # HuBERT 768-dim features
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            float(p_dropout),
+        )

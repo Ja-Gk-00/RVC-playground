@@ -14,8 +14,7 @@ class TrainingHistoryEntry:
 @dataclass
 class TrainingHistory:
     total_loss: list[float] = None
-
-    # Needed because default values in python are class-specific, not instance-specific
+    
     def __post_init__(self):
         self.train_loss = []
 
