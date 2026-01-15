@@ -2,3 +2,4 @@ data/ filter=lfs diff=lfs merge=lfs -text
 src/saved_models/ filter=lfs diff=lfs merge=lfs -text
 src/saved_models/hubert/hubert_base.pt filter=lfs diff=lfs merge=lfs -text
 src/saved_models/rmvpe/rmvpe.pt filter=lfs diff=lfs merge=lfs -text
+data/my_voice/lord_of_the_rings_chapter_I.wav filter=lfs diff=lfs merge=lfs -text
