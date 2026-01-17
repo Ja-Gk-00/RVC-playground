@@ -10,18 +10,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
+from fairseq.checkpoint_utils import load_model_ensemble_and_task
+import fairseq
 
+torch.serialization.add_safe_globals([fairseq.data.dictionary.Dictionary])
 
 def load_hubert_model(device: torch.device, is_half: bool = False) -> torch.nn.Module:
     """Load HuBERT model for content extraction using HuggingFace transformers."""
     from transformers import HubertModel
 
-    hubert_model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
-    hubert_model = hubert_model.to(device)
+    #hubert_model = HubertModel.from_pretrained("src/saved_models/hubert/hubert_base.pt")
+    #hubert_model = hubert_model.to(device)
+    hubert_model, cfg, task = load_model_ensemble_and_task(["src/saved_models/hubert/hubert_base.pt"])
+    hubert_model = hubert_model[0]
     if is_half:
         hubert_model = hubert_model.half()
     else:
         hubert_model = hubert_model.float()
+    hubert_model = hubert_model.to(device)
     return hubert_model.eval()
 
 
@@ -55,11 +61,20 @@ def extract_hubert_features(
         if feats.dim() == 1:
             feats = feats.unsqueeze(0)
 
+        padding_mask = torch.zeros(feats.shape[:2], dtype=torch.bool, device=feats.device)
+
+        with torch.no_grad():
+            out = model(
+                feats,
+                padding_mask=padding_mask,
+                mask=False,          # important: avoid training-time masking
+                features_only=True,  # typical for feature extraction
+        )
+
         # Extract features using HuggingFace API (v2 uses layer 12)
-        out = model(feats, output_hidden_states=True)
         # hidden_states is a tuple of 13 tensors (embedding + 12 layers)
         # layer 12 is index 12 (0 is embedding, 1-12 are transformer layers)
-        feats = out.hidden_states[12]  # [B, T, 768]
+        feats = out["x"] if isinstance(out, dict) else out
 
         return feats
 
