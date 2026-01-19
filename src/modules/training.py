@@ -52,6 +52,7 @@ def train_generator_from_features(
     fp16: bool = True,
     device: str | None = None,
     stats_csv: str | None = None,
+    expensive_metrics_every: int | None = 5,
 ) -> Generator:
 
     from src.utils.stats_logger import StatsLogger
@@ -106,6 +107,7 @@ def train_generator_from_features(
             fp16=fp16,
             device=device,
             stats_logger=stats_logger,
+            expensive_metrics_every=expensive_metrics_every,
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving model...")

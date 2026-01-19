@@ -13,7 +13,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import parametrizations
 from torch.utils.data import DataLoader
+import torchaudio.functional as F_audio
+from scipy.fftpack import dct
+from transformers import AutoFeatureExtractor, WavLMForXVector
 
+from src.constants import DEFAULT_RMVPE_PATH
+from src.models.rmvpe import RMVPE
 from src.data_models.data_models import InputData, OutputData, PreprocessedData, PreprocessedSample
 from src.models.synthesizer import SynthesizerTrn
 from src.models.model_base import ModelBase
@@ -178,6 +183,116 @@ def _kl_loss(
     kl = logs_p - logs_q - 0.5
     kl += 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2.0 * logs_p)
     return kl.mean()
+
+
+def _compute_mcd(mel_real: torch.Tensor, mel_fake: torch.Tensor, n_mfcc: int = 13) -> float:
+    """
+    Compute Mel Cepstral Distortion between real and generated mel spectrograms.
+
+    Args:
+        mel_real: [B, n_mels, T] log-mel spectrogram of real audio
+        mel_fake: [B, n_mels, T] log-mel spectrogram of generated audio
+        n_mfcc: Number of MFCCs to use (excluding c0)
+
+    Returns:
+        MCD in dB (lower is better, typically 4-8 dB is good)
+    """
+    # Convert to numpy [B, T, n_mels]
+    mel_real_np = mel_real.detach().cpu().numpy().transpose(0, 2, 1)
+    mel_fake_np = mel_fake.detach().cpu().numpy().transpose(0, 2, 1)
+
+    # Apply DCT to get MFCCs
+    mfcc_real = dct(mel_real_np, type=2, axis=-1, norm='ortho')[..., :n_mfcc]
+    mfcc_fake = dct(mel_fake_np, type=2, axis=-1, norm='ortho')[..., :n_mfcc]
+
+    # MCD formula (excluding c0, hence starting from index 1)
+    diff = mfcc_real[..., 1:] - mfcc_fake[..., 1:]
+    mcd = (10.0 / np.log(10)) * np.sqrt(2.0) * np.mean(np.sqrt(np.sum(diff ** 2, axis=-1)))
+    return float(mcd)
+
+
+def _compute_f0_correlation(f0_real: torch.Tensor, f0_gen: torch.Tensor) -> float:
+    """
+    Compute F0 Pearson correlation between real and generated F0.
+
+    Args:
+        f0_real: [B, T] ground truth F0 in Hz
+        f0_gen: [B, T] generated/extracted F0 in Hz
+
+    Returns:
+        Pearson correlation coefficient (higher is better, -1 to 1)
+    """
+    f0_real_np = f0_real.detach().cpu().numpy().flatten()
+    f0_gen_np = f0_gen.detach().cpu().numpy().flatten()
+
+    # Only compare voiced regions (F0 > 0)
+    voiced_mask = (f0_real_np > 0) & (f0_gen_np > 0)
+    if voiced_mask.sum() < 10:
+        return 0.0
+
+    f0_real_v = f0_real_np[voiced_mask]
+    f0_gen_v = f0_gen_np[voiced_mask]
+
+    # Pearson correlation
+    corr = np.corrcoef(f0_real_v, f0_gen_v)[0, 1]
+    return float(corr) if not np.isnan(corr) else 0.0
+
+
+def _compute_speaker_similarity(
+    wav_real: torch.Tensor,
+    wav_fake: torch.Tensor,
+    encoder: nn.Module,
+    feature_extractor: Any,
+    sr: int = 48000,
+) -> float:
+    """
+    Compute speaker embedding cosine similarity between real and generated audio.
+
+    Args:
+        wav_real: [B, N] real audio waveform
+        wav_fake: [B, N] generated audio waveform
+        encoder: Pre-loaded SpeakerVerification model from transformers
+        feature_extractor: Pre-loaded feature extractor for the speaker model
+        sr: Sample rate of the audio
+
+    Returns:
+        Cosine similarity (higher is better, 0 to 1)
+    """
+    # Speaker verification model expects 16kHz audio
+    target_sr = 16000
+
+    similarities = []
+    for i in range(wav_real.shape[0]):
+        # Resample to 16kHz
+        # Ensure float32 for high-quality resampling and metrics
+        wav_r = F_audio.resample(wav_real[i:i+1].cpu().float(), sr, target_sr)
+        wav_f = F_audio.resample(wav_fake[i:i+1].cpu().float(), sr, target_sr)
+
+        # Skip if audio too short (less than 0.5s)
+        if wav_r.shape[1] < target_sr * 0.5 or wav_f.shape[1] < target_sr * 0.5:
+            continue
+
+        # Get embeddings using Transformers
+        # Feature extractor handles normalization and format
+        inputs_r = feature_extractor(
+            wav_r.squeeze(0).numpy(), sampling_rate=target_sr, return_tensors="pt"
+        ).to(device=encoder.device, dtype=torch.float32)
+        inputs_f = feature_extractor(
+            wav_f.squeeze(0).numpy(), sampling_rate=target_sr, return_tensors="pt"
+        ).to(device=encoder.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            # WavLMForXVector returns an object with 'embeddings'
+            emb_real = encoder(**inputs_r).embeddings.squeeze(0).cpu().numpy()
+            emb_fake = encoder(**inputs_f).embeddings.squeeze(0).cpu().numpy()
+
+        # Cosine similarity
+        sim = np.dot(emb_real, emb_fake) / (
+            np.linalg.norm(emb_real) * np.linalg.norm(emb_fake) + 1e-8
+        )
+        similarities.append(float(sim))
+
+    return float(np.mean(similarities)) if similarities else 0.0
 
 
 @dataclass(frozen=True)
@@ -471,6 +586,7 @@ class Generator(ModelBase):
         c_fm: float = 2.0,
         c_kl: float = 1.0,
         stats_logger: Any | None = None,
+        expensive_metrics_every: int | None = 5,
     ) -> None:
         """
         Train the generator with VAE-style training.
@@ -485,6 +601,7 @@ class Generator(ModelBase):
             c_fm: Feature matching loss weight
             c_kl: KL divergence loss weight
             stats_logger: Optional StatsLogger instance for CSV logging
+            expensive_metrics_every: Compute F0 corr and speaker sim every N epochs
         """
         self.init_wandb_if_needed()
 
@@ -516,11 +633,31 @@ class Generator(ModelBase):
 
         scaler = torch.amp.GradScaler(enabled=bool(fp16 and dev.type == "cuda"))
 
+        speaker_encoder: nn.Module | None = None
+        speaker_feature_extractor: Any = None
+        rmvpe_model: Any = None
+
         for epoch in tqdm(range(epochs), desc="Training"):
             g_sum = 0.0
             d_sum = 0.0
             kl_sum = 0.0
+            mcd_sum = 0.0
             nb = 0
+
+            compute_expensive = expensive_metrics_every is not None and ((epoch % expensive_metrics_every == 0) or (epoch == epochs - 1))
+
+            if compute_expensive and speaker_encoder is None:
+                # Load WavLM instead of SpeechBrain
+                model_id = "microsoft/wavlm-base-plus-sv"
+                speaker_encoder = WavLMForXVector.from_pretrained(model_id).to(dev)
+                speaker_feature_extractor = AutoFeatureExtractor.from_pretrained(model_id)
+                speaker_encoder.eval()
+
+            if compute_expensive and rmvpe_model is None:
+                rmvpe_model = RMVPE(DEFAULT_RMVPE_PATH, is_half=False, device=dev)
+
+            f0_corr_samples: list[float] = []
+            spk_sim_samples: list[float] = []
 
             for content, f0, mel, wav_real in loader:
                 content = content.to(dev, non_blocking=True)
@@ -589,6 +726,41 @@ class Generator(ModelBase):
                 scaler.step(self.opt_g)
                 scaler.update()
 
+                mcd = _compute_mcd(mel_real, mel_fake)
+                mcd_sum += mcd
+
+                if compute_expensive:
+                    with torch.no_grad():
+                        # Extract F0 from generated audio (resample to 16kHz first)
+                        wav_fake_16k = F_audio.resample(
+                            wav_fake.detach().cpu().float(), self.target_sr, 16000
+                        )
+                        
+                        for i in range(wav_fake_16k.shape[0]):
+                            f0_gen = rmvpe_model.infer_from_audio(
+                                wav_fake_16k[i].numpy(), thred=0.03
+                            )
+                            # Downsample to match training F0 (hop 160 -> 320)
+                            f0_gen = f0_gen[::2]
+                            f0_real_i = f0[i].cpu()
+                            # Align lengths
+                            min_f0_len = min(len(f0_gen), f0_real_i.shape[0])
+                            f0_corr = _compute_f0_correlation(
+                                f0_real_i[:min_f0_len].unsqueeze(0),
+                                torch.from_numpy(f0_gen[:min_f0_len]).unsqueeze(0),
+                            )
+                            f0_corr_samples.append(f0_corr)
+
+                        # Speaker similarity
+                        spk_sim = _compute_speaker_similarity(
+                            wav_real.detach(),
+                            wav_fake.detach(),
+                            speaker_encoder,
+                            speaker_feature_extractor,
+                            sr=self.target_sr,
+                        )
+                        spk_sim_samples.append(spk_sim)
+
                 g_sum += float(loss_g.item())
                 d_sum += float(loss_d.item())
                 kl_sum += float(loss_kl.item())
@@ -597,8 +769,24 @@ class Generator(ModelBase):
             avg_g = g_sum / max(1, nb)
             avg_d = d_sum / max(1, nb)
             avg_kl = kl_sum / max(1, nb)
+            avg_mcd = mcd_sum / max(1, nb)
 
-            entry = TrainingHistoryEntry(epoch=epoch, total_loss=avg_g)
+            avg_f0_corr: float | None = None
+            avg_spk_sim: float | None = None
+            if f0_corr_samples:
+                avg_f0_corr = float(np.mean(f0_corr_samples))
+            if spk_sim_samples:
+                avg_spk_sim = float(np.mean(spk_sim_samples))
+
+            entry = TrainingHistoryEntry(
+                epoch=epoch,
+                total_loss=avg_g,
+                d_loss=avg_d,
+                kl_loss=avg_kl,
+                mcd=avg_mcd,
+                f0_corr=avg_f0_corr,
+                speaker_sim=avg_spk_sim,
+            )
             self.history_entries.append(entry)
 
             if self.wandb_details is not None:
@@ -612,11 +800,22 @@ class Generator(ModelBase):
                         "loss": avg_g,
                         "loss_d": avg_d,
                         "loss_kl": avg_kl,
+                        "mcd": avg_mcd,
+                        "f0_corr": avg_f0_corr,
+                        "speaker_sim": avg_spk_sim,
                     },
                     learning_rate=self.learning_rate,
                 )
 
             print(f"Epoch {epoch}: G={avg_g:.4f} D={avg_d:.4f} KL={avg_kl:.4f}")
+
+            # Build log message
+            log_msg = f"Epoch {epoch}: G={avg_g:.4f} D={avg_d:.4f} KL={avg_kl:.4f} MCD={avg_mcd:.2f}dB"
+            if avg_f0_corr is not None:
+                log_msg += f" F0corr={avg_f0_corr:.3f}"
+            if avg_spk_sim is not None:
+                log_msg += f" SpkSim={avg_spk_sim:.3f}"
+            print(log_msg)
 
         self.finish_wandb_if_needed()
 
