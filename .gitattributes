@@ -5,3 +5,5 @@ src/saved_models/rmvpe/rmvpe.pt filter=lfs diff=lfs merge=lfs -text
 data/my_voice/lord_of_the_rings_chapter_I.wav filter=lfs diff=lfs merge=lfs -text
 data/my_voice/lord_of_the_rings_chapter_I.wav filter=lfs diff=lfs merge=lfs -text
 data/to_inference_vocals/red_sun_in_the_sky_vocals.wav filter=lfs diff=lfs merge=lfs -text
+src/saved_models/fine_tuned/fine_tuned_model.index filter=lfs diff=lfs merge=lfs -text
+src/saved_models/fine_tuned/fine_tuned_generator.pth filter=lfs diff=lfs merge=lfs -text
