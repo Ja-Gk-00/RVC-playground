@@ -31,18 +31,7 @@ def preprocess_for_training(
     segment_overlap: float = 0.3,
     quiet: bool = False,
 ) -> None:
-    """
-    Produces:
-      seg_XXXXXX_units.npy   [T, 768]  - HuBERT layer 12 features at hop 320
-      seg_XXXXXX_f0.npy      [T]       - Raw F0 at hop 320
-      seg_XXXXXX_audio.npy   [N]       - Audio at target_sr (48kHz)
-      content_vectors.npy    [sum_T, 768]
-      faiss_index.index
 
-    IMPORTANT: Uses the same HuBERT and RMVPE extraction as inference_rvc.py
-    to ensure train/inference consistency.
-    """
-    # Import inference functions for consistent feature extraction
     from src.modules.inference_rvc import load_hubert_model, extract_hubert_features
     from src.models.rmvpe import RMVPE
     from src.constants import DEFAULT_RMVPE_PATH
@@ -56,7 +45,6 @@ def preprocess_for_training(
     target_T = int(round(segment_duration * content_sr / hop_length))
     target_N = int(target_T * samples_per_frame)
 
-    # Segment audio files
     pre = Preprocessor(
         target_sample_rate=content_sr,
         segment_duration=segment_duration,
@@ -64,7 +52,6 @@ def preprocess_for_training(
     )
     segmented = pre.preprocess(UnprocessedTrainingData(audio_dir_path=data_dir), quiet=quiet)
 
-    # Load models (same as inference!)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not quiet:
         print(f"Loading HuBERT model (HuggingFace transformers)...")
@@ -83,18 +70,13 @@ def preprocess_for_training(
 
         wav_t = torch.from_numpy(wav16).unsqueeze(0)  # [1, n] for HuBERT
 
-        # Extract HuBERT features (same as inference!)
         with torch.no_grad():
             content_t = extract_hubert_features(hubert, wav_t, device, is_half=False)
-            # content_t is [1, T, 768] at ~50Hz (hop 320)
             content = content_t.squeeze(0).cpu().numpy().astype(np.float32)  # [T, 768]
 
-        # Extract F0 using RMVPE (same as inference!)
         f0_raw = rmvpe.infer_from_audio(wav16_np, thred=0.03)  # At hop 160
-        # Downsample F0 to match HuBERT hop (160 -> 320)
         f0 = f0_raw[::2].astype(np.float32)  # [T]
 
-        # Enforce fixed T (stability + batching)
         if content.shape[0] < target_T:
             pad = target_T - content.shape[0]
             content = np.pad(content, ((0, pad), (0, 0)), mode="constant")
@@ -103,7 +85,6 @@ def preprocess_for_training(
             content = content[:target_T]
             f0 = f0[:target_T]
 
-        # Build target waveform at target_sr, aligned to T*samples_per_frame
         wav48_t = torchaudio.functional.resample(torch.from_numpy(wav16).unsqueeze(0), content_sr, target_sr)
         wav48 = wav48_t.squeeze(0).cpu().numpy().astype(np.float32)
 
@@ -112,7 +93,6 @@ def preprocess_for_training(
         else:
             wav48 = wav48[:target_N]
 
-        # Normalize target waveform
         peak = float(np.max(np.abs(wav48))) if wav48.size else 0.0
         if peak > 0:
             wav48 = (wav48 / peak).astype(np.float32)

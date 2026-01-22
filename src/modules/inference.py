@@ -55,29 +55,10 @@ def run_inference(
     index_data_path: str | None = None,
     index_rate: float = 0.5,
     k: int = 8,
-    noise_scale: float = 0.66666,  # Match reference RVC coefficient
+    noise_scale: float = 0.66666, 
 ) -> None:
-    """
-    Run voice conversion inference.
-
-    Args:
-        input_path: Path to input audio file
-        output_path: Path to save converted audio
-        model_name: Name of the trained model (from Jar)
-        hubert_path: Optional path to HuBERT model
-        rmvpe_path: Optional path to RMVPE model
-        use_pitch: Whether to use F0 (always True for NSF)
-        target_sr: Target sample rate
-        device: Device to run on
-        index_path: Optional path to FAISS index for retrieval
-        index_data_path: Optional path to content vectors for retrieval
-        index_rate: Blend ratio for retrieval (0-1)
-        k: Number of neighbors for retrieval
-        noise_scale: Noise scale for sampling (0 = deterministic)
-    """
     dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load generator (Jar object)
     g = Generator.load(model_name)
     g.synthesizer.to(dev).eval()
 
@@ -94,7 +75,6 @@ def run_inference(
     content = content_t.cpu().numpy().astype(np.float32)  # [T, 768]
     f0 = f0_t.cpu().numpy().astype(np.float32)            # [T]
 
-    # Optional retrieval
     if index_path and index_rate > 0:
         idx_p = Path(index_path)
         if idx_p.exists():
@@ -113,13 +93,10 @@ def run_inference(
     content_tensor = torch.from_numpy(content).to(dev)  # [T, 768]
     f0_tensor = torch.from_numpy(f0).to(dev)            # [T]
 
-    # Run inference using new synthesizer architecture
     with torch.inference_mode():
-        # Transpose content to [1, 768, T] and add batch dim to f0
         content_input = content_tensor.unsqueeze(0).transpose(1, 2)  # [1, 768, T]
         f0_input = f0_tensor.unsqueeze(0)  # [1, T]
 
-        # Generate audio using synthesizer inference (uses prior, no mel needed)
         y = g.synthesizer.infer(content_input, f0_input, noise_scale=noise_scale)
         y = y.squeeze(0).clamp(-1, 1).cpu()
 
@@ -134,21 +111,8 @@ def run_inference_from_features(
     f0: np.ndarray,
     model_name: str,
     device: str | None = None,
-    noise_scale: float = 0.66666,  # Match reference RVC coefficient
+    noise_scale: float = 0.66666,
 ) -> np.ndarray:
-    """
-    Run inference directly from pre-extracted features.
-
-    Args:
-        content: [T, 768] HuBERT content features
-        f0: [T] F0 in Hz
-        model_name: Name of trained model
-        device: Device to run on
-        noise_scale: Noise scale for sampling
-
-    Returns:
-        [N] generated audio waveform
-    """
     dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     g = Generator.load(model_name)

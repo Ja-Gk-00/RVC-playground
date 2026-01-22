@@ -41,6 +41,7 @@ Examples:
     parser.add_argument("--fp16", action="store_true", default=True, help="Use FP16 training (default: True)")
     parser.add_argument("--no_fp16", action="store_true", help="Disable FP16 training")
     parser.add_argument("--device", default=None, help="e.g. cuda, cuda:0, cpu")
+    parser.add_argument("--stats_csv", default=None, help="Path to CSV file for logging training statistics")
 
     args = parser.parse_args()
 
@@ -62,6 +63,7 @@ Examples:
         pretrained_d=args.pretrained_d,
         fp16=fp16,
         device=args.device,
+        stats_csv=args.stats_csv,
     )
 
 

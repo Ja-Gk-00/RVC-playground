@@ -470,6 +470,7 @@ class Generator(ModelBase):
         c_mel: float = 45.0,
         c_fm: float = 2.0,
         c_kl: float = 1.0,
+        stats_logger: Any | None = None,
     ) -> None:
         """
         Train the generator with VAE-style training.
@@ -483,6 +484,7 @@ class Generator(ModelBase):
             c_mel: Mel-spectrogram loss weight
             c_fm: Feature matching loss weight
             c_kl: KL divergence loss weight
+            stats_logger: Optional StatsLogger instance for CSV logging
         """
         self.init_wandb_if_needed()
 
@@ -601,6 +603,18 @@ class Generator(ModelBase):
 
             if self.wandb_details is not None:
                 self.log_to_wandb(entry)
+
+            # Log to CSV if stats_logger is provided
+            if stats_logger is not None:
+                stats_logger.log_dict(
+                    epoch=epoch,
+                    losses={
+                        "loss": avg_g,
+                        "loss_d": avg_d,
+                        "loss_kl": avg_kl,
+                    },
+                    learning_rate=self.learning_rate,
+                )
 
             print(f"Epoch {epoch}: G={avg_g:.4f} D={avg_d:.4f} KL={avg_kl:.4f}")
 

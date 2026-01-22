@@ -1,5 +1,4 @@
 # src/modules/training.py
-"""Training module for RVC generator."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,7 +10,6 @@ from src.models.generator import Generator
 
 
 def _load_feature_triplets(feature_dir: Path) -> PreprocessedData:
-    """Load preprocessed feature triplets from directory."""
     content_files = sorted(feature_dir.glob("*_units.npy"))
     f0_files = sorted(feature_dir.glob("*_f0.npy"))
     audio_files = sorted(feature_dir.glob("*_audio.npy"))
@@ -53,29 +51,10 @@ def train_generator_from_features(
     pretrained_d: str | None = None,
     fp16: bool = True,
     device: str | None = None,
+    stats_csv: str | None = None,
 ) -> Generator:
-    """
-    Train RVC generator from preprocessed features.
 
-    Args:
-        feature_dir: Directory containing preprocessed features
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        content_dim: HuBERT content dimension (768)
-        hidden_dim: Latent dimension (192)
-        target_sr: Target sample rate
-        learning_rate: Learning rate
-        model_name: Name to save model as in Jar
-        pretrained_rvc: Load official RVC pretrained weights (RECOMMENDED)
-        pretrained: Path to custom pretrained model
-        pretrained_g: Path to custom pretrained generator
-        pretrained_d: Path to custom pretrained discriminator
-        fp16: Use mixed precision training
-        device: Device to train on
-
-    Returns:
-        Trained Generator model
-    """
+    from src.utils.stats_logger import StatsLogger
     feature_path = Path(feature_dir)
     data = _load_feature_triplets(feature_path)
 
@@ -114,13 +93,31 @@ def train_generator_from_features(
         print("WARNING: Training from scratch. This may take a long time.")
         print("         Consider using --pretrained_rvc for faster training.")
 
+    # Setup stats logger
+    stats_logger = StatsLogger(stats_csv) if stats_csv else None
+    if stats_csv:
+        print(f"Logging training stats to: {stats_csv}")
+
     try:
-        g.train(data, epochs=epochs, batch_size=batch_size, fp16=fp16, device=device)
+        g.train(
+            data,
+            epochs=epochs,
+            batch_size=batch_size,
+            fp16=fp16,
+            device=device,
+            stats_logger=stats_logger,
+        )
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving model...")
         g.save(model_name)
         print(f"Model saved as: {model_name}")
+        if stats_logger:
+            stats_logger.close()
         return g
+
+    if stats_logger:
+        stats_logger.close()
+        print(f"Training stats saved to: {stats_csv}")
 
     g.save(model_name)
     print(f"\nTraining complete! Model saved as: {model_name}")

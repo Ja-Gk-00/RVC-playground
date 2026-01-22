@@ -16,11 +16,8 @@ import fairseq
 torch.serialization.add_safe_globals([fairseq.data.dictionary.Dictionary])
 
 def load_hubert_model(device: torch.device, is_half: bool = False) -> torch.nn.Module:
-    """Load HuBERT model for content extraction using HuggingFace transformers."""
     from transformers import HubertModel
 
-    #hubert_model = HubertModel.from_pretrained("src/saved_models/hubert/hubert_base.pt")
-    #hubert_model = hubert_model.to(device)
     hubert_model, cfg, task = load_model_ensemble_and_task(["src/saved_models/hubert/hubert_base.pt"])
     hubert_model = hubert_model[0]
     if is_half:
@@ -37,14 +34,7 @@ def extract_hubert_features(
     device: torch.device,
     is_half: bool = False,
 ) -> torch.Tensor:
-    """Extract HuBERT content features from audio.
-
-    Args:
-        model: HuBERT model (HuggingFace transformers)
-        audio: [1, T] audio at 16kHz
-        device: Device to run on
-        is_half: Use half precision
-
+    """
     Returns:
         [B, T', 768] content features
     """
@@ -67,13 +57,10 @@ def extract_hubert_features(
             out = model(
                 feats,
                 padding_mask=padding_mask,
-                mask=False,          # important: avoid training-time masking
-                features_only=True,  # typical for feature extraction
+                mask=False, 
+                features_only=True, 
         )
 
-        # Extract features using HuggingFace API (v2 uses layer 12)
-        # hidden_states is a tuple of 13 tensors (embedding + 12 layers)
-        # layer 12 is index 12 (0 is embedding, 1-12 are transformer layers)
         feats = out["x"] if isinstance(out, dict) else out
 
         return feats
@@ -85,18 +72,6 @@ def extract_f0_rmvpe(
     device: torch.device,
     f0_up_key: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Extract F0 using RMVPE.
-
-    Args:
-        audio: Audio samples
-        sr: Sample rate (should be 16kHz)
-        device: Device
-        f0_up_key: Pitch shift in semitones
-
-    Returns:
-        f0_coarse: Quantized F0 for embedding (1-255)
-        f0: Raw F0 in Hz
-    """
     from src.models.rmvpe import RMVPE
     from src.constants import DEFAULT_RMVPE_PATH
 
@@ -106,10 +81,8 @@ def extract_f0_rmvpe(
     # Extract F0
     f0 = rmvpe.infer_from_audio(audio, thred=0.03)
 
-    # Apply pitch shift
     f0 *= pow(2, f0_up_key / 12)
 
-    # Quantize to mel scale for embedding
     f0_min = 50
     f0_max = 1100
     f0_mel_min = 1127 * np.log(1 + f0_min / 700)
@@ -129,26 +102,12 @@ def load_synthesizer(
     device: torch.device,
     is_half: bool = False,
 ) -> torch.nn.Module:
-    """Load RVC synthesizer model matching reference implementation.
-
-    Args:
-        model_path: Path to .pth model file
-        device: Device to load on
-        is_half: Use half precision
-
-    Returns:
-        Synthesizer model
-    """
     from src.models.synthesizer_rvc import SynthesizerTrnMs768NSFsid, SynthesizerTrnMs256NSFsid
 
-    # Load checkpoint
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-
-    # Get version and f0 flag (reference style)
     version = ckpt.get("version", "v2")
     if_f0 = ckpt.get("f0", 1)
 
-    # Get state dict - reference uses "weight", pretrained uses "model"
     if "weight" in ckpt:
         state_dict = ckpt["weight"]
     elif "model" in ckpt:
@@ -156,29 +115,18 @@ def load_synthesizer(
     else:
         state_dict = ckpt
 
-    # Get config - reference uses list format that gets unpacked
     config = ckpt.get("config", None)
 
     if config is not None and isinstance(config, (list, tuple)):
-        # Reference format: config is a list of positional args
-        # [spec_channels, segment_size, inter_channels, hidden_channels,
-        #  filter_channels, n_heads, n_layers, kernel_size, p_dropout,
-        #  resblock, resblock_kernel_sizes, resblock_dilation_sizes,
-        #  upsample_rates, upsample_initial_channel, upsample_kernel_sizes,
-        #  spk_embed_dim, gin_channels, sr]
-
-        # Update spk_embed_dim from actual weights if available
         if "emb_g.weight" in state_dict:
             config = list(config)
-            config[-3] = state_dict["emb_g.weight"].shape[0]  # spk_embed_dim
+            config[-3] = state_dict["emb_g.weight"].shape[0]
 
-        # Select model class based on version
         if version == "v2":
             model = SynthesizerTrnMs768NSFsid(*config, is_half=is_half)
         else:
             model = SynthesizerTrnMs256NSFsid(*config, is_half=is_half)
     else:
-        # Fallback: use defaults for v2 48k
         model = SynthesizerTrnMs768NSFsid(
             spec_channels=1025,
             segment_size=32,
@@ -201,11 +149,9 @@ def load_synthesizer(
             is_half=is_half,
         )
 
-    # Delete enc_q (not needed for inference, matches reference)
     if hasattr(model, 'enc_q'):
         del model.enc_q
 
-    # Load weights with strict=False (reference style)
     model.load_state_dict(state_dict, strict=False)
 
     model.eval()
@@ -218,10 +164,6 @@ def load_synthesizer(
 
 
 def resample_audio(audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
-    """High-quality audio resampling using Kaiser window.
-
-    Better quality than default torchaudio.functional.resample for voice.
-    """
     if orig_sr == target_sr:
         return audio
 
@@ -248,20 +190,6 @@ def run_inference_rvc(
     chunk_seconds: float = 10.0,
     protect: float = 0.33,
 ) -> None:
-    """Run RVC inference matching reference implementation.
-
-    Args:
-        input_path: Path to input audio
-        model_path: Path to RVC model (.pth)
-        output_path: Path to save output
-        speaker_id: Speaker ID for embedding
-        f0_up_key: Pitch shift in semitones
-        index_path: Path to FAISS index (optional)
-        index_rate: Index mixing rate
-        device: Device to use
-        chunk_seconds: Process audio in chunks of this many seconds (saves memory)
-        protect: Protect voiceless consonants (0-0.5, higher = more protection)
-    """
     # Setup device
     if device is None:
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,7 +198,6 @@ def run_inference_rvc(
 
     print(f"Using device: {dev}")
 
-    # Load audio
     audio, sr = torchaudio.load(input_path)
     if audio.shape[0] > 1:
         audio = audio.mean(dim=0, keepdim=True)
@@ -297,7 +224,6 @@ def run_inference_rvc(
     from src.constants import DEFAULT_RMVPE_PATH
     rmvpe = RMVPE(DEFAULT_RMVPE_PATH, is_half=False, device=dev)
 
-    # Determine chunk size (in 16kHz samples)
     chunk_samples = int(chunk_seconds * 16000)
     overlap_samples = int(0.5 * 16000)  # 0.5 second overlap
 
@@ -339,8 +265,6 @@ def run_inference_rvc(
     if max_val > 0:
         audio_out = audio_out / max_val * 0.95
 
-    # Save as [1, T] tensor for torchaudio
-    # Output is always mono at 48kHz (RVC native rate)
     audio_tensor = torch.from_numpy(audio_out).unsqueeze(0).float()
     torchaudio.save(output_path, audio_tensor, 48000)
     print(f"Saved to {output_path} (mono, 48kHz)")
@@ -359,17 +283,9 @@ def _process_chunk(
     index_rate: float,
     protect: float = 0.33,
 ) -> np.ndarray:
-    """Process a single audio chunk.
-
-    Args:
-        protect: Protection ratio for voiceless consonants (0-0.5).
-                Higher values preserve more of original timbre in unvoiced regions.
-    """
     # Extract HuBERT features
     feats = extract_hubert_features(hubert, audio, dev, is_half=False)
 
-    # Store original features before index mixing (for protect parameter)
-    # Protect preserves original timbre in unvoiced regions
     feats_original = feats.clone()
 
     # Apply index if provided
@@ -392,15 +308,12 @@ def _process_chunk(
         except Exception as e:
             warnings.warn(f"Failed to apply index: {e}")
 
-    # Interpolate features by 2x (both original and processed)
     feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
     feats_original = F.interpolate(feats_original.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
 
-    # Extract F0 using passed rmvpe
     f0 = rmvpe.infer_from_audio(audio_np, thred=0.03)
     f0 *= pow(2, f0_up_key / 12)
 
-    # Apply median filter to smooth F0 (reduces crackling artifacts)
     from scipy.ndimage import median_filter
     voiced_mask = f0 > 0
     if np.sum(voiced_mask) > 5:
@@ -426,18 +339,10 @@ def _process_chunk(
     f0_coarse = f0_coarse[:p_len]
     f0 = f0[:p_len]
 
-    # Apply protect parameter - blend original features in unvoiced regions
-    # This preserves consonants and breathiness
     if protect > 0 and protect < 0.5:
-        # Create mask for unvoiced regions (where f0 is 0)
         pitchf_tensor = torch.from_numpy(f0).unsqueeze(0).unsqueeze(2).to(dev)  # [1, T, 1]
-
-        # Protect masks original features where pitch is near zero
-        # protect=0.5 means full protection (use original), protect=0 means no protection
         protect_mask = (pitchf_tensor < 0.001).float()  # [1, T, 1]
 
-        # Blend: in unvoiced regions, use mix of original and processed features
-        # Higher protect value = more original features preserved
         feats_original = feats_original.to(dev)
         feats = feats * (1 - protect_mask * protect * 2) + feats_original * (protect_mask * protect * 2)
 
@@ -460,7 +365,6 @@ def _process_chunk(
 
 
 def _crossfade_chunks(chunks: list, overlap_samples: int) -> np.ndarray:
-    """Crossfade overlapping audio chunks."""
     if len(chunks) == 1:
         return chunks[0]
 

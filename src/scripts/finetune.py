@@ -619,7 +619,8 @@ def train_step(model, batch, optimizer, scaler, device, c_mel=45, c_kl=0.1):
 
 def train_step_gan(
     model, discriminator, batch, optim_g, optim_d, scaler, device,
-    c_mel=45, c_kl=0.1, c_fm=2, c_adv=1, use_gan=True, use_fp16=False
+    c_mel=45, c_kl=0.1, c_fm=2, c_adv=1, use_gan=True, use_fp16=False,
+    compute_metrics=False,
 ):
     """
     Single training step with GAN losses.
@@ -638,6 +639,7 @@ def train_step_gan(
         c_adv: Adversarial loss coefficient
         use_gan: Whether to use GAN training
         use_fp16: Use mixed precision (FP16)
+        compute_metrics: Compute quality metrics (MCD, discriminator accuracy)
     """
     from src.models.commons import slice_segments
 
@@ -687,6 +689,13 @@ def train_step_gan(
     losses['loss_mel'] = loss_mel.item()
     losses['loss_kl'] = loss_kl.item()
 
+    # Compute MCD if metrics requested
+    if compute_metrics:
+        from src.utils.metrics import compute_mcd
+        with torch.no_grad():
+            mcd_value = compute_mcd(y_hat_mel, y_mel)
+            losses['mcd'] = mcd_value
+
     # ========== GAN Training ==========
     if use_gan and discriminator is not None:
         from src.models.discriminator import (
@@ -707,6 +716,14 @@ def train_step_gan(
         scaler.step(optim_d)
 
         losses['loss_d'] = loss_d.item()
+
+        # Compute discriminator accuracy if metrics requested
+        if compute_metrics:
+            from src.utils.metrics import compute_discriminator_accuracy
+            with torch.no_grad():
+                d_acc = compute_discriminator_accuracy(y_d_rs, y_d_gs)
+                losses['d_acc_real'] = d_acc['d_acc_real']
+                losses['d_acc_fake'] = d_acc['d_acc_fake']
 
         # ---------- Train Generator with GAN losses ----------
         optim_g.zero_grad()
@@ -868,6 +885,8 @@ def finetune(
     features_dir: Optional[str] = None,
     use_fp16: bool = False,
     disc_warmup_epochs: int = 5,
+    stats_csv: Optional[str] = None,
+    compute_metrics: bool = False,
 ):
     """Fine-tune RVC model on voice data.
 
@@ -885,7 +904,11 @@ def finetune(
         features_dir: Directory to cache preprocessed features (only for data_dir mode)
         use_fp16: Use mixed precision (FP16) - faster but can be unstable
         disc_warmup_epochs: Number of epochs to train generator only before adding discriminator
+        stats_csv: Path to CSV file for logging training statistics
+        compute_metrics: Compute quality metrics (MCD, F0 RMSE, D accuracy) during training
     """
+    from src.utils.stats_logger import StatsLogger
+    from src.utils.metrics import compute_mcd, compute_discriminator_accuracy, MetricsTracker
     # Validate inputs
     if not preprocessed_dir and not data_dir:
         raise ValueError("Either --preprocessed_dir or --data_dir must be provided")
@@ -1019,21 +1042,33 @@ def finetune(
     import warnings
     warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*optimizer.step.*")
 
+    # Setup stats logger
+    stats_logger = StatsLogger(stats_csv) if stats_csv else None
+    if stats_csv:
+        logger.info(f"Logging training stats to: {stats_csv}")
+
     # Training loop
     logger.info("Starting training...")
     logger.info(f"FAISS index saved to: {index_path}")
     logger.info(f"GAN training: {'enabled' if use_gan else 'disabled'}")
     logger.info(f"Mixed precision (FP16): {'enabled' if use_fp16 else 'disabled (recommended)'}")
     logger.info(f"Discriminator warmup: {disc_warmup_epochs} epochs")
+    if compute_metrics:
+        logger.info("Quality metrics computation: enabled (MCD, D accuracy)")
 
     # KL warmup: start with low weight, increase to full weight (1.0) over first 10 epochs
     # Reference RVC uses c_kl=1.0 - this is CRITICAL for proper VAE training
     kl_warmup_epochs = 10
     kl_target = 1.0  # Must match reference! Was incorrectly 0.1
 
+    # Metrics tracker for accumulating batch metrics
+    metrics_tracker = MetricsTracker() if compute_metrics else None
+
     for epoch in range(1, epochs + 1):
         epoch_losses = {}
         num_batches = 0
+        if metrics_tracker:
+            metrics_tracker.reset()
 
         # KL coefficient warmup - ramps from 0 to kl_target over warmup period
         kl_coef = min(1.0, epoch / kl_warmup_epochs) * kl_target
@@ -1069,7 +1104,8 @@ def finetune(
             losses = train_step_gan(
                 model, discriminator if use_disc_this_epoch else None,
                 batch, optim_g, optim_d if use_disc_this_epoch else None,
-                scaler, dev, c_kl=kl_coef, use_gan=use_disc_this_epoch, use_fp16=use_fp16
+                scaler, dev, c_kl=kl_coef, use_gan=use_disc_this_epoch, use_fp16=use_fp16,
+                compute_metrics=compute_metrics,
             )
 
             for k, v in losses.items():
@@ -1095,7 +1131,26 @@ def finetune(
             log_msg += f", kl={epoch_losses['loss_kl']:.4f}"
         if use_gan and 'loss_adv' in epoch_losses:
             log_msg += f", adv={epoch_losses['loss_adv']:.4f}, fm={epoch_losses.get('loss_fm', 0):.4f}"
+        # Add quality metrics to log
+        if compute_metrics:
+            if 'mcd' in epoch_losses:
+                log_msg += f", MCD={epoch_losses['mcd']:.2f}dB"
+            if 'd_acc_real' in epoch_losses:
+                log_msg += f", D_acc(R/F)={epoch_losses['d_acc_real']:.1%}/{epoch_losses['d_acc_fake']:.1%}"
         logger.info(log_msg)
+
+        # Log to CSV if stats_logger is provided
+        if stats_logger is not None:
+            current_lr = optim_g.param_groups[0]['lr']
+            # Separate metrics from losses for proper logging
+            metrics_dict = {}
+            if compute_metrics:
+                for key in ['mcd', 'd_acc_real', 'd_acc_fake']:
+                    if key in epoch_losses:
+                        metrics_dict[key] = epoch_losses[key]
+            stats_logger.log_dict(
+                epoch=epoch, losses=epoch_losses, learning_rate=current_lr, metrics=metrics_dict
+            )
 
         # Step scheduler with the loss (ReduceLROnPlateau needs the metric)
         scheduler_g.step(epoch_losses['loss'])
@@ -1152,6 +1207,11 @@ def finetune(
             ).to(dev)
             model.enc_q.load_state_dict(enc_q_state)
 
+    # Close stats logger
+    if stats_logger is not None:
+        stats_logger.close()
+        logger.info(f"Training stats saved to: {stats_csv}")
+
     logger.info(f"Training complete!")
     logger.info(f"  Model: {output_path}")
     logger.info(f"  Index: {index_path}")
@@ -1206,6 +1266,10 @@ Examples:
     # Advanced options
     parser.add_argument("--fp16", action="store_true", default=False,
                         help="Use mixed precision FP16 (faster but can be unstable)")
+    parser.add_argument("--stats_csv", default=None,
+                        help="Path to CSV file for logging training statistics")
+    parser.add_argument("--compute_metrics", action="store_true", default=False,
+                        help="Compute quality metrics (MCD, F0 RMSE, D accuracy) during training")
 
     args = parser.parse_args()
 
@@ -1223,6 +1287,8 @@ Examples:
         features_dir=args.features_dir,
         use_fp16=args.fp16,
         disc_warmup_epochs=args.disc_warmup,
+        stats_csv=args.stats_csv,
+        compute_metrics=args.compute_metrics,
     )
 
 
